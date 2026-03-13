@@ -1,0 +1,13 @@
+# Apple Silicon (M1/M2/M3) 전용
+mlx>=0.21.0
+mlx-lm>=0.21.0
+mlx-vlm>=0.1.0
+
+# HuggingFace 모델 다운로드
+huggingface_hub>=0.24.0
+
+# PDF 처리
+PyMuPDF>=1.24.0
+
+# 이미지
+Pillow>=10.0.0
