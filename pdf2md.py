@@ -1,87 +1,71 @@
 #!/usr/bin/env python3
 """
-PDF → Markdown 변환기 (MLX / Apple M2 최적화)
+PDF → Markdown 변환기
 
 파이프라인
 ──────────
-1. 모델 자동 다운로드 (HuggingFace Hub, 캐시 재사용)
-2. PyMuPDF
-   - 각 페이지 → RGB 이미지
+1. PyMuPDF
+   - 각 페이지 → RGB 이미지 (base64)
    - 삽입된 래스터 이미지(그림·도표·사진) 별도 추출
-3. DeepSeek-OCR-2  [mlx_vlm, 8-bit]
-   - 페이지 전체 텍스트 OCR
-   - 삽입 이미지별 시각 설명  ← OCR 이 놓친 이미지 보완
-   → 완료 후 모델 해제
-4. Qwen3.5-4B  [mlx_lm, 4-bit]
-   - OCR 원시 텍스트 + 이미지 설명 → 마크다운 구조화
-   → 완료 후 모델 해제
-5. 페이지 구분자(---) 포함 .md 파일 저장
+2. LM Studio (OpenAI 호환 API, localhost:1234)
+   - Stage 1: 페이지 이미지 → 원시 텍스트 OCR (비전 입력)
+   - Stage 2: OCR 텍스트 + 이미지 설명 → 마크다운 구조화
+3. 페이지 구분자(---) 포함 .md 파일 저장
 
-메모리 전략 (M2 16 GB Unified Memory)
-  두 대형 모델을 동시에 올리지 않기 위해
-  OCR 단계 완료 → Metal 캐시 해제 → Qwen 로드 순서로 처리한다.
+설정
+  LM_STUDIO_BASE_URL  환경변수로 엔드포인트 변경 가능 (기본 http://localhost:1234/v1)
+  LM_STUDIO_MODEL     환경변수로 모델 변경 가능 (기본 qwen/qwen3.5-35b-a3b)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import io
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 import fitz  # PyMuPDF
 from PIL import Image
-import mlx.core as mx
 
 
 # ──────────────────────────────────────────────────────────────
-# 모델 ID (mlx-community 공식 MLX 최적화 버전)
+# LM Studio 설정
 # ──────────────────────────────────────────────────────────────
-OCR_MODEL_ID  = "mlx-community/DeepSeek-OCR-2-8bit"   # VLM (페이지 OCR)
-VLM_MODEL_ID  = "mlx-community/Qwen3.5-4B-MLX-4bit"   # VLM (이미지 설명 + 마크다운)
+LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LM_STUDIO_MODEL    = os.environ.get("LM_STUDIO_MODEL",    "qwen/qwen3.5-35b-a3b")
 
-DEFAULT_DPI   = 150   # M2 16 GB 기준 속도/품질 균형
+DEFAULT_DPI   = 150
 MAX_TOKENS    = 4096
-MIN_IMAGE_PX  = 100   # 삽입 이미지 최소 크기 (아이콘 등 제외)
+MIN_IMAGE_PX  = 100
 
 
 # ──────────────────────────────────────────────────────────────
-# 모델 자동 다운로드
+# OpenAI 클라이언트 (LM Studio 호환)
 # ──────────────────────────────────────────────────────────────
-def ensure_model(repo_id: str) -> None:
-    """
-    모델이 HuggingFace 캐시에 없으면 다운로드한다.
-    이미 캐시된 경우 즉시 반환한다.
-    """
-    from huggingface_hub import snapshot_download, try_to_load_from_cache
-    from huggingface_hub.utils import RepositoryNotFoundError
-
-    # 캐시 존재 여부 빠르게 확인 (config.json 기준)
-    cached = try_to_load_from_cache(repo_id, "config.json")
-    if cached is not None and cached != "UNAVAILABLE":  # 캐시 히트
-        print(f"  ✓ 캐시 사용: {repo_id}")
-        return
-
-    print(f"  ↓ 다운로드 시작: {repo_id}")
-    print(f"    (첫 실행 시에만 진행됩니다. 이후에는 캐시를 재사용합니다)")
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            ignore_patterns=["*.pt", "*.bin", "*.gguf"],  # safetensors·MLX 파일만
-        )
-    except RepositoryNotFoundError:
-        print(f"  오류: 모델을 찾을 수 없습니다 → {repo_id}", file=sys.stderr)
-        raise
-    print(f"  ✓ 다운로드 완료: {repo_id}\n")
+def _get_client():
+    from openai import OpenAI
+    return OpenAI(base_url=LM_STUDIO_BASE_URL, api_key="lm-studio")
 
 
-def ensure_all_models() -> None:
-    print("=== 모델 준비 ===")
-    ensure_model(OCR_MODEL_ID)
-    ensure_model(VLM_MODEL_ID)
-    print()
+def _img_to_b64(img: Image.Image) -> str:
+    """PIL Image → PNG base64 문자열."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _chat(client, messages: list[dict], max_tokens: int = MAX_TOKENS) -> str:
+    resp = client.chat.completions.create(
+        model=LM_STUDIO_MODEL,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+    return resp.choices[0].message.content.strip()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -123,80 +107,47 @@ def extract_embedded_images(pdf_path: str) -> dict[int, list[Image.Image]]:
     return result
 
 
-def _save_tmp(img: Image.Image) -> str:
-    """PIL Image → 임시 PNG 경로."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    img.save(tmp.name, format="PNG")
-    tmp.close()
-    return tmp.name
-
-
-def _free_mlx() -> None:
-    gc.collect()
-    try:
-        mx.metal.clear_cache()
-    except AttributeError:
-        pass
-
-
 # ──────────────────────────────────────────────────────────────
-# Stage 1 : OCR + 이미지 설명  (DeepSeek-OCR-2, mlx_vlm)
+# Stage 1 : OCR  (비전 입력 → 원시 텍스트)
 # ──────────────────────────────────────────────────────────────
 _OCR_PROMPT = (
-    "Extract ALL text visible in this document page image exactly as it appears. "
-    "Preserve headings, paragraphs, tables, bullet lists, footnotes, and captions. "
-    "If a region contains only an image or diagram with no readable text, "
-    "write '[IMAGE]' as a placeholder."
+    "You are an OCR engine. Extract all text from this document page image exactly as it appears. "
+    "Preserve the original structure including headings, lists, and tables. "
+    "Output only the extracted text with no commentary."
 )
 
+
+def run_ocr_stage(client, page_images: list[Image.Image]) -> list[str]:
+    """각 페이지 이미지를 LM Studio에 전송해 원시 텍스트를 추출한다."""
+    print(f"[1/2] OCR 시작 — {len(page_images)}페이지 / 모델: {LM_STUDIO_MODEL}\n")
+    raw_texts: list[str] = []
+    for i, img in enumerate(page_images, start=1):
+        print(f"  OCR  [{i:>3}/{len(page_images)}]", end=" ", flush=True)
+        b64 = _img_to_b64(img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text", "text": _OCR_PROMPT},
+                ],
+            }
+        ]
+        raw_texts.append(_chat(client, messages))
+        print("완료")
+    print()
+    return raw_texts
+
+
+# ──────────────────────────────────────────────────────────────
+# Stage 2 : 이미지 설명 + 마크다운 변환
+# ──────────────────────────────────────────────────────────────
 _IMG_DESC_PROMPT = (
     "Describe this image concisely and accurately in one to three sentences. "
     "Focus on content relevant to a document: charts, graphs, diagrams, photos, etc. "
     "Skip purely decorative elements."
 )
 
-
-def _vlm_generate(model, processor, image_path: str | None, prompt: str,
-                  max_tokens: int = MAX_TOKENS) -> str:
-    from mlx_vlm import generate as vlm_generate
-    return vlm_generate(
-        model, processor, image_path, prompt,
-        max_tokens=max_tokens, verbose=False,
-    ).strip()
-
-
-def run_ocr_stage(page_images: list[Image.Image]) -> list[str]:
-    """
-    DeepSeek-OCR-2로 각 페이지의 텍스트를 추출한다.
-    완료 후 모델 해제.
-    """
-    from mlx_vlm import load as vlm_load
-    from mlx_vlm.prompt_utils import apply_chat_template
-    from mlx_vlm.utils import load_config
-
-    print(f"[1/2] DeepSeek-OCR-2 로드 중...")
-    model, processor = vlm_load(OCR_MODEL_ID)
-    config = load_config(OCR_MODEL_ID)
-    print(f"      로드 완료. {len(page_images)}페이지 OCR 시작.\n")
-
-    raw_texts: list[str] = []
-    for i, page_img in enumerate(page_images, start=1):
-        print(f"  OCR  [{i:>3}/{len(page_images)}]", end=" ", flush=True)
-        path = _save_tmp(page_img)
-        prompt = apply_chat_template(config, _OCR_PROMPT, num_images=1)
-        raw_texts.append(_vlm_generate(model, processor, path, prompt))
-        Path(path).unlink(missing_ok=True)
-        print("완료")
-
-    del model, processor
-    _free_mlx()
-    print("\n      DeepSeek-OCR-2 해제.\n")
-    return raw_texts
-
-
-# ──────────────────────────────────────────────────────────────
-# Stage 2 : 이미지 설명 + 마크다운 변환  (Qwen3.5-VL, mlx_vlm)
-# ──────────────────────────────────────────────────────────────
 _MD_SYSTEM = """\
 You are a document formatting expert.
 Convert the given raw OCR text (and optional image descriptions) into clean, well-structured Markdown.
@@ -212,55 +163,42 @@ Rules:
 - Output ONLY the Markdown — no preamble, no explanation"""
 
 
-def _describe_embedded_images(
-    model, processor, config,
-    embedded_imgs: list[Image.Image],
-    page_num: int,
-) -> list[str]:
-    """삽입 이미지 각각을 Qwen3.5-VL로 설명한다."""
-    from mlx_vlm import generate as vlm_generate
-    from mlx_vlm.prompt_utils import apply_chat_template
-
-    descriptions: list[str] = []
-    for j, img in enumerate(embedded_imgs, start=1):
-        print(f"    그림  [페이지 {page_num}, 그림 {j}]", end=" ", flush=True)
-        path = _save_tmp(img)
-        prompt = apply_chat_template(config, _IMG_DESC_PROMPT, num_images=1)
-        desc = _vlm_generate(model, processor, path, prompt, max_tokens=512)
-        Path(path).unlink(missing_ok=True)
-        descriptions.append(desc)
-        print("완료")
-    return descriptions
+def _describe_image(client, img: Image.Image) -> str:
+    b64 = _img_to_b64(img)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text", "text": _IMG_DESC_PROMPT},
+            ],
+        }
+    ]
+    return _chat(client, messages, max_tokens=512)
 
 
 def run_vlm_stage(
+    client,
     raw_texts: list[str],
     embedded: dict[int, list[Image.Image]],
 ) -> list[str]:
     """
-    Qwen3.5-VL로:
+    LM Studio로:
       1) 삽입 이미지 시각 설명 (OCR이 놓친 그림·도표 보완)
       2) OCR 텍스트 + 이미지 설명 → 마크다운 구조화
-    완료 후 모델 해제.
     """
-    from mlx_vlm import load as vlm_load
-    from mlx_vlm.prompt_utils import apply_chat_template
-    from mlx_vlm.utils import load_config
-
-    print(f"[2/2] Qwen3.5-VL 로드 중...")
-    model, processor = vlm_load(VLM_MODEL_ID)
-    config = load_config(VLM_MODEL_ID)
-    print(f"      로드 완료. {len(raw_texts)}페이지 처리 시작.\n")
-
+    print(f"[2/2] 마크다운 변환 시작 — {len(raw_texts)}페이지\n")
     md_pages: list[str] = []
     for i, raw in enumerate(raw_texts, start=1):
         # ── 삽입 이미지 설명 ────────────────────────────────────
         page_imgs = embedded.get(i - 1, [])
+        descs: list[str] = []
         if page_imgs:
             print(f"  이미지 감지 [페이지 {i}] {len(page_imgs)}개")
-            descs = _describe_embedded_images(model, processor, config, page_imgs, i)
-        else:
-            descs = []
+            for j, img in enumerate(page_imgs, start=1):
+                print(f"    그림  [페이지 {i}, 그림 {j}]", end=" ", flush=True)
+                descs.append(_describe_image(client, img))
+                print("완료")
 
         # ── 마크다운 변환 ────────────────────────────────────────
         print(f"  MD   [{i:>3}/{len(raw_texts)}]", end=" ", flush=True)
@@ -276,62 +214,100 @@ def run_vlm_stage(
             f"{figure_block}\n\n"
             "Convert to Markdown:"
         )
-        # 텍스트 전용 생성 (이미지 없이 프롬프트만)
-        prompt = apply_chat_template(config, user_msg, num_images=0)
-        result = _vlm_generate(model, processor, None, prompt)
-        md_pages.append(result)
+        messages = [
+            {"role": "system", "content": _MD_SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ]
+        md_pages.append(_chat(client, messages))
         print("완료")
 
-    del model, processor
-    _free_mlx()
-    print("\n      Qwen3.5-VL 해제.\n")
+    print()
     return md_pages
 
 
 # ──────────────────────────────────────────────────────────────
 # 메인 파이프라인
 # ──────────────────────────────────────────────────────────────
+def parse_pages(spec: str, total: int) -> list[int]:
+    """
+    페이지 범위 문자열을 0-based 인덱스 리스트로 변환한다.
+    예) "1-3,5,7-9"  →  [0, 1, 2, 4, 6, 7, 8]
+    페이지 번호는 1-based, 반환값은 0-based.
+    """
+    indices: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            if lo < 1 or hi > total or lo > hi:
+                raise ValueError(f"잘못된 페이지 범위: {part} (총 {total}페이지)")
+            indices.update(range(lo - 1, hi))
+        else:
+            n = int(part)
+            if n < 1 or n > total:
+                raise ValueError(f"잘못된 페이지 번호: {n} (총 {total}페이지)")
+            indices.add(n - 1)
+    return sorted(indices)
+
+
 def convert(
     pdf_path: str,
     output_path: str | None = None,
     dpi: int = DEFAULT_DPI,
-    skip_qwen: bool = False,
+    skip_md: bool = False,
+    pages: str | None = None,
 ) -> str:
     src = Path(pdf_path)
     if not src.exists():
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {src}")
     dst = Path(output_path) if output_path else src.with_suffix(".md")
 
-    # 0. 모델 다운로드 (캐시 있으면 스킵)
-    ensure_all_models()
+    client = _get_client()
 
     print("=== 변환 시작 ===")
-    print(f"입력: {src}  출력: {dst}  DPI: {dpi}\n")
+    print(f"입력: {src}  출력: {dst}  DPI: {dpi}")
+    print(f"엔드포인트: {LM_STUDIO_BASE_URL}  모델: {LM_STUDIO_MODEL}\n")
 
     # 1. PDF → 이미지
     print("PDF 렌더링 중...")
-    page_images = pdf_to_page_images(str(src), dpi=dpi)
-    print(f"  {len(page_images)}페이지 완료.\n")
+    all_page_images = pdf_to_page_images(str(src), dpi=dpi)
+    total_pages = len(all_page_images)
+    print(f"  전체 {total_pages}페이지.\n")
 
-    # 2. 삽입 이미지 탐지
+    # 페이지 선택
+    if pages:
+        indices = parse_pages(pages, total_pages)
+        page_images = [all_page_images[i] for i in indices]
+        print(f"  선택된 페이지: {[i+1 for i in indices]} ({len(indices)}페이지)\n")
+    else:
+        indices = list(range(total_pages))
+        page_images = all_page_images
+    del all_page_images
+
+    # 2. 삽입 이미지 탐지 (선택된 페이지만 필터)
     print("삽입 이미지 탐지 중...")
-    embedded = extract_embedded_images(str(src))
+    all_embedded = extract_embedded_images(str(src))
+    # 0-based 원본 인덱스 → 선택 순서 인덱스로 재매핑
+    embedded = {new_i: all_embedded[orig_i]
+                for new_i, orig_i in enumerate(indices)
+                if orig_i in all_embedded}
     total_emb = sum(len(v) for v in embedded.values())
     if embedded:
         print(f"  {len(embedded)}개 페이지 / 총 {total_emb}개 이미지 발견.\n")
     else:
         print("  삽입 이미지 없음.\n")
 
-    # 3. OCR (DeepSeek-OCR-2)
-    raw_texts = run_ocr_stage(page_images)
+    # 3. OCR
+    raw_texts = run_ocr_stage(client, page_images)
     del page_images
-    _free_mlx()
+    gc.collect()
 
-    # 4. 이미지 설명 + 마크다운 변환 (Qwen3.5-VL)
-    if skip_qwen:
+    # 4. 마크다운 변환
+    if skip_md:
         md_pages = raw_texts
     else:
-        md_pages = run_vlm_stage(raw_texts, embedded)
+        md_pages = run_vlm_stage(client, raw_texts, embedded)
 
     # 5. 저장
     content = "\n\n---\n\n".join(md_pages)
@@ -345,19 +321,21 @@ def convert(
 # ──────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PDF → Markdown 변환 (MLX / Apple Silicon 최적화)"
+        description="PDF → Markdown 변환 (LM Studio / OpenAI 호환 API)"
     )
     parser.add_argument("pdf", help="변환할 PDF 파일 경로")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="출력 .md 파일 경로 (기본: 입력파일명.md)")
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
                         help=f"렌더링 해상도 (기본 {DEFAULT_DPI}, 높을수록 정확)")
-    parser.add_argument("--skip-qwen", action="store_true",
-                        help="Qwen 마크다운 변환 생략 (OCR 원시 결과 저장)")
+    parser.add_argument("--skip-md", action="store_true",
+                        help="마크다운 변환 생략 (OCR 원시 결과 저장)")
+    parser.add_argument("--pages", metavar="RANGE",
+                        help="변환할 페이지 범위 (예: 1-3,5,7-9). 기본: 전체")
     args = parser.parse_args()
 
     try:
-        convert(args.pdf, args.output, dpi=args.dpi, skip_qwen=args.skip_qwen)
+        convert(args.pdf, args.output, dpi=args.dpi, skip_md=args.skip_md, pages=args.pages)
     except FileNotFoundError as exc:
         print(f"오류: {exc}", file=sys.stderr)
         sys.exit(1)
