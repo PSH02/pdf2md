@@ -1,6 +1,9 @@
 # LM Studio OpenAI 호환 클라이언트 (원격 모드)
 openai>=1.30.0
 
+# GUI 드래그앤드롭 (PyQt6)
+PyQt6>=6.5.0
+
 # PDF 처리
 PyMuPDF>=1.24.0
 

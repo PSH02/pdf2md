@@ -40,6 +40,46 @@ from PIL import Image
 
 
 # ──────────────────────────────────────────────────────────────
+# 사고 과정 제거
+# ──────────────────────────────────────────────────────────────
+import re as _re
+
+def strip_thinking(text: str) -> str:
+    """
+    모델이 출력한 사고 과정(Chain-of-Thought)을 제거하고 실제 내용만 반환한다.
+
+    케이스별 처리:
+    A. 텍스트가 <think> 또는 "Thinking Process:" 로 시작 + </think> 존재
+       → </think> 이후를 실제 내용으로 사용
+    B. 텍스트가 <think> 또는 "Thinking Process:" 로 시작 + </think> 없음
+       → 전체가 사고 과정, 빈 문자열 반환
+    C. 중간에 <think>...</think> 블록이 포함된 경우 (일반 내용에 사고 삽입)
+       → 블록만 제거하고 나머지 유지
+    """
+    stripped = text.lstrip()
+    starts_with_thinking = (
+        stripped.startswith("<think>") or
+        stripped.startswith("Thinking Process:")
+    )
+
+    if starts_with_thinking:
+        if "</think>" in text:
+            # A: </think> 이후가 실제 내용 (마지막 </think> 기준)
+            idx = text.rfind("</think>")
+            text = text[idx + len("</think>"):].lstrip("\n")
+        else:
+            # B: 전체가 사고 과정
+            text = ""
+    else:
+        # C: 내용 중간에 삽입된 <think>...</think> 블록 제거
+        text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL)
+
+    # 남은 고아 태그 정리
+    text = text.replace("</think>", "").replace("<think>", "")
+    return text.strip()
+
+
+# ──────────────────────────────────────────────────────────────
 # LM Studio 설정
 # ──────────────────────────────────────────────────────────────
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -142,7 +182,7 @@ def run_ocr_stage(client, page_images: list[Image.Image]) -> list[str]:
                 ],
             }
         ]
-        raw_texts.append(_chat(client, messages))
+        raw_texts.append(strip_thinking(_chat(client, messages)))
         print("완료")
     print()
     return raw_texts
@@ -227,7 +267,7 @@ def run_vlm_stage(
             {"role": "system", "content": _MD_SYSTEM},
             {"role": "user",   "content": user_msg},
         ]
-        md_pages.append(_chat(client, messages))
+        md_pages.append(strip_thinking(_chat(client, messages)))
         print("완료")
 
     print()
@@ -270,7 +310,7 @@ def run_ocr_stage_local(page_images: list[Image.Image]) -> list[str]:
     for i, img in enumerate(page_images, start=1):
         print(f"  OCR  [{i:>3}/{len(page_images)}]", end=" ", flush=True)
         path = _save_tmp(img)
-        raw_texts.append(_mlx_generate(model, processor, path, _OCR_PROMPT))
+        raw_texts.append(strip_thinking(_mlx_generate(model, processor, path, _OCR_PROMPT)))
         Path(path).unlink(missing_ok=True)
         print("완료")
 
@@ -311,7 +351,7 @@ def run_vlm_stage_local(
             f"{figure_block}\n\n"
             "Convert to Markdown:"
         )
-        md_pages.append(_mlx_generate(model, processor, None, prompt))
+        md_pages.append(strip_thinking(_mlx_generate(model, processor, None, prompt)))
         print("완료")
 
     del model, processor
