@@ -7,12 +7,13 @@ LM Studio의 OpenAI 호환 API를 통해 원격 LLM을 사용합니다.
 
 ## 사용 모델
 
-| 역할 | 모델 |
-|------|------|
-| 페이지 OCR + 이미지 설명 + 마크다운 변환 | `qwen/qwen3.5-35b-a3b` (LM Studio, localhost:1234) |
+| 모드 | 모델 | 비고 |
+|------|------|------|
+| 원격 (기본) | `qwen/qwen3.5-35b-a3b` | LM Studio, localhost:1234 |
+| 로컬 (`--local`) | `mlx-community/Qwen3.5-4B-MLX-4bit` | Apple Silicon 전용, mlx_vlm |
 
-모델 로드·다운로드는 **LM Studio에서 직접 관리**합니다.
-스크립트 실행 전에 LM Studio를 실행하고 해당 모델을 로드해두어야 합니다.
+**원격 모드:** LM Studio를 실행하고 해당 모델을 로드해두어야 합니다.
+**로컬 모드:** 첫 실행 시 HuggingFace에서 모델을 자동 다운로드합니다.
 
 ---
 
@@ -36,8 +37,17 @@ PDF
 ## 요구사항
 
 - Python 3.10 이상
+
+**원격 모드 (기본)**
 - [LM Studio](https://lmstudio.ai/) 실행 중 + `qwen/qwen3.5-35b-a3b` 모델 로드됨
 - LM Studio 로컬 서버 활성화 (기본 포트: 1234)
+
+**로컬 모드 (`--local`)**
+- Apple Silicon (M1/M2/M3)
+- `mlx`, `mlx-lm`, `mlx-vlm` 별도 설치 필요:
+  ```zsh
+  pip install mlx>=0.21.0 mlx-lm>=0.21.0 mlx-vlm>=0.1.0
+  ```
 
 ---
 
@@ -65,6 +75,9 @@ python pdf2md.py 문서.pdf --dpi 250
 # OCR만 사용 (마크다운 변환 생략, 빠름)
 python pdf2md.py 문서.pdf --skip-md
 
+# 로컬 MLX 모드 (LM Studio 불필요, Apple Silicon 전용)
+python pdf2md.py 문서.pdf --local
+
 # 페이지 범위 지정
 python pdf2md.py 문서.pdf --pages 1-3
 python pdf2md.py 문서.pdf --pages 1,3,5
@@ -80,6 +93,7 @@ python pdf2md.py 문서.pdf --pages 1-3,5,7-9
 | `--dpi` | `150` | 렌더링 해상도 (높을수록 정확하나 느림) |
 | `--skip-md` | `false` | 마크다운 변환 생략, OCR 원시 결과 저장 |
 | `--pages` | 전체 | 변환할 페이지 범위 (예: `1-3`, `1,3,5`, `1-3,5,7-9`) |
+| `--local` | `false` | 로컬 MLX 모드 (`mlx-community/Qwen3.5-4B-MLX-4bit`, Apple Silicon 전용) |
 | `--base-url` | `http://localhost:1234/v1` | LM Studio 엔드포인트 |
 | `--model` | `qwen/qwen3.5-35b-a3b` | 사용할 모델 ID |
 
@@ -103,6 +117,15 @@ python pdf2md.py 문서.pdf --pages 1-3,5,7-9
 ---
 
 ## 변경 히스토리
+
+### v2.2.0 — 2026-03-13
+
+**로컬 MLX 모드 추가 (`--local`)**
+
+- **추가:** `--local` 옵션 — LM Studio 없이 `mlx-community/Qwen3.5-4B-MLX-4bit`로 로컬 실행
+- OCR과 마크다운 변환 모두 동일 모델로 처리 (모델 1회 로드 후 양 스테이지 공유)
+- 완료 후 Metal 캐시 해제로 메모리 반환
+- mlx/mlx-lm/mlx-vlm은 선택적 의존성 (로컬 모드 사용 시에만 별도 설치)
 
 ### v2.1.0 — 2026-03-13
 

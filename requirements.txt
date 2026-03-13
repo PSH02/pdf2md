@@ -1,4 +1,4 @@
-# LM Studio OpenAI 호환 클라이언트
+# LM Studio OpenAI 호환 클라이언트 (원격 모드)
 openai>=1.30.0
 
 # PDF 처리
@@ -6,3 +6,7 @@ PyMuPDF>=1.24.0
 
 # 이미지
 Pillow>=10.0.0
+
+# ── 로컬 모드 전용 (--local 옵션 사용 시 별도 설치) ──────────────
+# pip install mlx>=0.21.0 mlx-lm>=0.21.0 mlx-vlm>=0.1.0
+# Apple Silicon(M1/M2/M3) 전용

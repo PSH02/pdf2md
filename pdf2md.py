@@ -2,18 +2,25 @@
 """
 PDF → Markdown 변환기
 
+모드
+────
+  원격 (기본): LM Studio OpenAI 호환 API (localhost:1234)
+               qwen/qwen3.5-35b-a3b
+  로컬 (--local): mlx_vlm + mlx-community/Qwen3.5-4B-MLX-4bit
+                  Apple Silicon 전용, 인터넷 불필요
+
 파이프라인
 ──────────
 1. PyMuPDF
-   - 각 페이지 → RGB 이미지 (base64)
+   - 각 페이지 → RGB 이미지
    - 삽입된 래스터 이미지(그림·도표·사진) 별도 추출
-2. LM Studio (OpenAI 호환 API, localhost:1234)
+2. LLM (원격 또는 로컬)
    - Stage 1: 페이지 이미지 → 원시 텍스트 OCR (비전 입력)
    - Stage 2: OCR 텍스트 + 이미지 설명 → 마크다운 구조화
 3. 페이지 구분자(---) 포함 .md 파일 저장
 
-설정
-  LM_STUDIO_BASE_URL  환경변수로 엔드포인트 변경 가능 (기본 http://localhost:1234/v1)
+설정 (원격 모드)
+  LM_STUDIO_BASE_URL  환경변수로 엔드포인트 변경 가능 (기본 http://127.0.0.1:1234/v1)
   LM_STUDIO_MODEL     환경변수로 모델 변경 가능 (기본 qwen/qwen3.5-35b-a3b)
 """
 
@@ -37,6 +44,8 @@ from PIL import Image
 # ──────────────────────────────────────────────────────────────
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_MODEL    = os.environ.get("LM_STUDIO_MODEL",    "qwen/qwen3.5-35b-a3b")
+
+LOCAL_VLM_MODEL_ID = "mlx-community/Qwen3.5-4B-MLX-4bit"
 
 DEFAULT_DPI   = 150
 MAX_TOKENS    = 4096
@@ -226,6 +235,97 @@ def run_vlm_stage(
 
 
 # ──────────────────────────────────────────────────────────────
+# 로컬 모드 : mlx_vlm + Qwen3.5-4B MLX 4-bit
+# ──────────────────────────────────────────────────────────────
+def _save_tmp(img: Image.Image) -> str:
+    """PIL Image → 임시 PNG 경로 (mlx_vlm은 파일 경로 필요)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp.name, format="PNG")
+    tmp.close()
+    return tmp.name
+
+
+def _mlx_generate(model, processor, image_path: str | None, prompt: str,
+                  max_tokens: int = MAX_TOKENS) -> str:
+    from mlx_vlm import generate as vlm_generate
+    return vlm_generate(
+        model, processor,
+        prompt=prompt,
+        image=image_path,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        verbose=False,
+    ).strip()
+
+
+def run_ocr_stage_local(page_images: list[Image.Image]) -> list[str]:
+    """mlx_vlm으로 각 페이지 이미지에서 원시 텍스트를 추출한다."""
+    from mlx_vlm import load as vlm_load
+    print(f"[1/2] OCR 시작 (로컬) — {len(page_images)}페이지 / {LOCAL_VLM_MODEL_ID}")
+    print("      모델 로드 중...")
+    model, processor = vlm_load(LOCAL_VLM_MODEL_ID)
+    print(f"      로드 완료.\n")
+
+    raw_texts: list[str] = []
+    for i, img in enumerate(page_images, start=1):
+        print(f"  OCR  [{i:>3}/{len(page_images)}]", end=" ", flush=True)
+        path = _save_tmp(img)
+        raw_texts.append(_mlx_generate(model, processor, path, _OCR_PROMPT))
+        Path(path).unlink(missing_ok=True)
+        print("완료")
+
+    print()
+    return model, processor, raw_texts
+
+
+def run_vlm_stage_local(
+    model, processor,
+    raw_texts: list[str],
+    embedded: dict[int, list[Image.Image]],
+) -> list[str]:
+    """mlx_vlm으로 이미지 설명 + 마크다운 변환한다. 완료 후 모델 해제."""
+    print(f"[2/2] 마크다운 변환 시작 (로컬) — {len(raw_texts)}페이지\n")
+    md_pages: list[str] = []
+    for i, raw in enumerate(raw_texts, start=1):
+        page_imgs = embedded.get(i - 1, [])
+        descs: list[str] = []
+        if page_imgs:
+            print(f"  이미지 감지 [페이지 {i}] {len(page_imgs)}개")
+            for j, img in enumerate(page_imgs, start=1):
+                print(f"    그림  [페이지 {i}, 그림 {j}]", end=" ", flush=True)
+                path = _save_tmp(img)
+                descs.append(_mlx_generate(model, processor, path, _IMG_DESC_PROMPT, max_tokens=512))
+                Path(path).unlink(missing_ok=True)
+                print("완료")
+
+        print(f"  MD   [{i:>3}/{len(raw_texts)}]", end=" ", flush=True)
+        figure_block = ""
+        if descs:
+            lines = [f"> **[Figure {k}]** {d}" for k, d in enumerate(descs, 1)]
+            figure_block = "\n\n" + "\n".join(lines)
+
+        prompt = (
+            f"{_MD_SYSTEM}\n\n"
+            f"[Page {i}]\n\n"
+            f"--- RAW OCR TEXT ---\n{raw}\n--- END ---"
+            f"{figure_block}\n\n"
+            "Convert to Markdown:"
+        )
+        md_pages.append(_mlx_generate(model, processor, None, prompt))
+        print("완료")
+
+    del model, processor
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.metal.clear_cache()
+    except Exception:
+        pass
+    print("\n      Qwen3.5-4B MLX 해제.\n")
+    return md_pages
+
+
+# ──────────────────────────────────────────────────────────────
 # 메인 파이프라인
 # ──────────────────────────────────────────────────────────────
 def parse_pages(spec: str, total: int) -> list[int]:
@@ -257,17 +357,21 @@ def convert(
     dpi: int = DEFAULT_DPI,
     skip_md: bool = False,
     pages: str | None = None,
+    local: bool = False,
 ) -> str:
     src = Path(pdf_path)
     if not src.exists():
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {src}")
     dst = Path(output_path) if output_path else src.with_suffix(".md")
 
-    client = _get_client()
-
     print("=== 변환 시작 ===")
     print(f"입력: {src}  출력: {dst}  DPI: {dpi}")
-    print(f"엔드포인트: {LM_STUDIO_BASE_URL}  모델: {LM_STUDIO_MODEL}\n")
+    if local:
+        print(f"모드: 로컬 (mlx_vlm)  모델: {LOCAL_VLM_MODEL_ID}\n")
+    else:
+        print(f"모드: 원격 (LM Studio)  엔드포인트: {LM_STUDIO_BASE_URL}  모델: {LM_STUDIO_MODEL}\n")
+
+    client = None if local else _get_client()
 
     # 1. PDF → 이미지
     print("PDF 렌더링 중...")
@@ -299,13 +403,19 @@ def convert(
         print("  삽입 이미지 없음.\n")
 
     # 3. OCR
-    raw_texts = run_ocr_stage(client, page_images)
+    if local:
+        mlx_model, mlx_processor, raw_texts = run_ocr_stage_local(page_images)
+    else:
+        raw_texts = run_ocr_stage(client, page_images)
+        mlx_model = mlx_processor = None
     del page_images
     gc.collect()
 
     # 4. 마크다운 변환
     if skip_md:
         md_pages = raw_texts
+    elif local:
+        md_pages = run_vlm_stage_local(mlx_model, mlx_processor, raw_texts, embedded)
     else:
         md_pages = run_vlm_stage(client, raw_texts, embedded)
 
@@ -332,10 +442,13 @@ def main() -> None:
                         help="마크다운 변환 생략 (OCR 원시 결과 저장)")
     parser.add_argument("--pages", metavar="RANGE",
                         help="변환할 페이지 범위 (예: 1-3,5,7-9). 기본: 전체")
+    parser.add_argument("--local", action="store_true",
+                        help=f"로컬 MLX 모드 사용 ({LOCAL_VLM_MODEL_ID}, Apple Silicon 전용)")
     args = parser.parse_args()
 
     try:
-        convert(args.pdf, args.output, dpi=args.dpi, skip_md=args.skip_md, pages=args.pages)
+        convert(args.pdf, args.output, dpi=args.dpi, skip_md=args.skip_md,
+                pages=args.pages, local=args.local)
     except FileNotFoundError as exc:
         print(f"오류: {exc}", file=sys.stderr)
         sys.exit(1)
